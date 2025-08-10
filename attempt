@@ -1,0 +1,852 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/README.md b/README.md
+index 07334823858341da0e93ee5aeb9be7fff0195894..09491c27c50169c14d23a04a58fb1d982f7fd05c 100644
+--- a/README.md
++++ b/README.md
+@@ -1,9 +1,61 @@
+-# imageir
+-image scraping and sorting 
+-echo "# imageir" >> README.md
+-git init
+-git add README.md
+-git commit -m "first commit"
+-git branch -M main
+-git remote add origin https://github.com/callkaidsroofing/imageir.git
+-git push -u origin main
++# Image Drive Sorter (Chrome Extension)
++
++Authenticate with Google, scan Drive folders for images, auto-sort/rename/move them by rules, de-duplicate by checksum, and export a CSV manifest back to Drive.
++
++## Features
++- ✅ Google OAuth2 in Manifest V3 via `launchWebAuthFlow`
++- ✅ Scans any chosen Drive folder for `mimeType contains 'image/'`
++- ✅ Auto-rename using tokens `{date}`, `{job}`, `{seq}`, `{name}`
++- ✅ Auto-move using a template path like `{year}/{month}-{job}`
++- ✅ De-duplicate using Drive `md5Checksum` (trashes dupes)
++- ✅ Dry-run mode (preview plan, no writes)
++- ✅ CSV manifest written to `/_manifests/` under your root
++- ✅ No build step. Load unpacked and go.
++
++## One-time Setup (Google Cloud Console)
++1. Create a project at <https://console.cloud.google.com/>.
++2. Enable **Google Drive API**.
++3. Configure **OAuth consent screen** (External). Add scopes:
++   - `.../auth/drive`
++   - `.../auth/drive.metadata`
++   - `.../auth/drive.file`
++4. Create **OAuth client ID** of type **Web application**.
++   - Authorized redirect URI: use the value shown in **Options** page (it looks like `https://<extension-id>.chromiumapp.org/oauth2` but during setup you don’t yet know the ID. Use the one shown after loading unpacked once, or copy the redirect from Options after first load and add it here).
++   - Save the generated **Client ID**.
++
++## Install (Dev Mode)
++1. Copy `config.example.js` to `config.js` and paste your **Client ID**.
++2. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, select the folder.
++3. Right-click the extension → **Options**:
++   - Paste Client ID (also stored to `chrome.storage.local`).
++   - Set **Root Folder ID** (where sorted images will be moved).
++   - Or click **Pick from Top Level** after signing in to choose a root.
++
++## Usage
++1. Click the extension icon → **Sign in with Google**.
++2. In the popup, paste a **Folder ID** to scan (not the root).
++3. Adjust **Rules** JSON (or keep defaults). Toggle **Dry run** as needed.
++4. **Scan** to preview plan → **Apply** to execute (or simulate in Dry run).
++5. A CSV manifest will be written under `/_manifests/` in your root.
++
++### How to get a Folder ID
++- In Drive web UI, open a folder → URL ends with `/folders/<FOLDER_ID>`.
++
++## Rules Reference
++- `renamePattern`: e.g. `{date}_{job}_{seq}` → `2025-08-10-clarinda-001.jpg`
++- `moveTemplate`: e.g. `{year}/{month}-{job}` → `2025/08-clarinda`
++- `jobHints`: regex strings; first match becomes `{job}`
++- `dedupe`: `true|false` (trashes duplicates by md5)
++- `dryRun`: `true|false`
++- `pageSize`: Drive query page size (default 200)
++- `manifestName`: output CSV file name
++
++## Notes
++- We rely on Drive’s `imageMediaMetadata.time` or `createdTime` for `{date}`.
++- Duplicates are **trashed** (recoverable) when `dedupe=true`.
++- Moving files uses Drive’s `addParents/removeParents` with folder creation on demand.
++
++## Troubleshooting
++- If auth fails, ensure the **redirect URI** in Google Cloud matches the one shown in Options.
++- If folders don’t appear for picking, click **Sign in** on Options first to grant scopes.
++- Rate limits: lower `pageSize` if you hit quota errors.
+diff --git a/assets/icon128.png b/assets/icon128.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..acb6d04d5dad1ee7b38b1f649643b9dc4fe15ec6
+GIT binary patch
+literal 390
+zcmeAS@N?(olHy`uVBq!ia0vp^4Is?H1|$#LC7xzrVD$BLaSW-L^Y)S<BZC6Z0fPhk
+zpDQN23$xl*r9ZpybsO`I)CLRYBa#Z|7z)`sj2-4MKH?Eb9~HtH5_j0&mNWm|>K9rG
+P3||IMS3j3^P6<r_N#J@~
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/icon16.png b/assets/icon16.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f1e672d0dbb0ff65fd40651903ba50ace2fbade
+GIT binary patch
+literal 85
+zcmeAS@N?(olHy`uVBq!ia0vp^0wB!61|;P_|4#%`GM+AuAr*6y|NQ@N&#c<esdRTS
+iTaT1M)&T`028QHW%(Aa{AASc^$KdJe=d#Wzp$Pz1qZj=E
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/icon48.png b/assets/icon48.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..d34b46a6173653e79f53d14033e30c413490e921
+GIT binary patch
+literal 137
+zcmeAS@N?(olHy`uVBq!ia0vp^1|ZDA1|-9oezpUt08bakkcv5P&pYxmC<q)dII#b@
+tGfRJ4O6Z2SGb8P-tsaCjN09(;u?i+L$KI7zlmnX0;OXk;vd$@?2>{(_A*BES
+
+literal 0
+HcmV?d00001
+
+diff --git a/background.js b/background.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..158ca6dd91d3c3df07de2435fa4da2bebe6fe982
+--- /dev/null
++++ b/background.js
+@@ -0,0 +1,366 @@
++import { OAUTH, DEFAULT_RULES } from "./config.js"; // You must create config.js from config.example.js
++
++const API_BASE = "https://www.googleapis.com";
++const DRIVE_FILES = `${API_BASE}/drive/v3/files`;
++const DRIVE_UPLOAD = `${API_BASE}/upload/drive/v3/files`;
++
++let session = {
++  accessToken: null,
++  tokenExpiry: 0
++};
++
++chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
++  (async () => {
++    try {
++      if (msg.type === "AUTH") {
++        const tok = await getAccessTokenInteractive(msg.interactive);
++        sendResponse({ ok: true, token: tok });
++      } else if (msg.type === "SCAN") {
++        const res = await scanFolder(msg.folderId, msg.rules || DEFAULT_RULES);
++        sendResponse({ ok: true, ...res });
++      } else if (msg.type === "APPLY") {
++        const res = await applyChanges(msg.plan, msg.rules || DEFAULT_RULES);
++        sendResponse({ ok: true, ...res });
++      } else if (msg.type === "LIST_FOLDERS") {
++        const res = await listTopFolders();
++        sendResponse({ ok: true, folders: res });
++      } else {
++        sendResponse({ ok: false, error: "Unknown message type" });
++      }
++    } catch (e) {
++      console.error(e);
++      sendResponse({ ok: false, error: e?.message || String(e) });
++    }
++  })();
++
++  // Keep the message channel open for async
++  return true;
++});
++
++async function getAccessTokenInteractive(interactive = true) {
++  // Reuse cached token if valid
++  const now = Math.floor(Date.now() / 1000);
++  if (session.accessToken && session.tokenExpiry - 60 > now) {
++    return session.accessToken;
++  }
++
++  const redirectUri = chrome.identity.getRedirectURL("oauth2");
++  const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
++  authUrl.searchParams.set("client_id", OAUTH.clientId);
++  authUrl.searchParams.set("response_type", "token");
++  authUrl.searchParams.set("redirect_uri", redirectUri);
++  authUrl.searchParams.set("scope", OAUTH.scopes.join(" "));
++  authUrl.searchParams.set("prompt", "consent");
++  authUrl.searchParams.set("include_granted_scopes", "true");
++
++  const resultUrl = await chrome.identity.launchWebAuthFlow({
++    url: authUrl.toString(),
++    interactive
++  });
++
++  const hash = new URL(resultUrl).hash.substring(1);
++  const params = new URLSearchParams(hash);
++  const access_token = params.get("access_token");
++  const expires_in = Number(params.get("expires_in") || "3600");
++
++  if (!access_token) throw new Error("Failed to obtain access token");
++
++  session.accessToken = access_token;
++  session.tokenExpiry = Math.floor(Date.now() / 1000) + expires_in;
++  return access_token;
++}
++
++async function authFetch(url, init = {}) {
++  const token = await getAccessTokenInteractive(false);
++  const headers = new Headers(init.headers || {});
++  headers.set("Authorization", `Bearer ${token}`);
++  if (!headers.has("Content-Type") && init.method && init.method !== "GET") {
++    headers.set("Content-Type", "application/json");
++  }
++  return fetch(url, { ...init, headers });
++}
++
++async function listTopFolders() {
++  // List top-level folders for user to pick a root
++  const q = encodeURIComponent("mimeType = 'application/vnd.google-apps.folder' and 'root' in parents and trashed = false");
++  const url = `${DRIVE_FILES}?q=${q}&fields=files(id,name)&pageSize=100`;
++  const res = await authFetch(url);
++  if (!res.ok) throw new Error("Failed listing folders");
++  const data = await res.json();
++  return data.files || [];
++}
++
++function tokeniseDate(file) {
++  // Prefer imageMediaMetadata.time; fallback to createdTime
++  const t =
++    file.imageMediaMetadata?.time ||
++    file.createdTime ||
++    file.modifiedTime ||
++    null;
++  if (!t) return { date: "unknown", year: "unknown", month: "unknown" };
++  const d = new Date(t);
++  const yyyy = `${d.getFullYear()}`;
++  const mm = `${d.getMonth() + 1}`.padStart(2, "0");
++  const dd = `${d.getDate()}`.padStart(2, "0");
++  return { date: `${yyyy}-${mm}-${dd}`, year: yyyy, month: mm, day: dd };
++}
++
++function inferJobName(file, rules) {
++  const name = file.name || "";
++  for (const re of rules.jobHints || []) {
++    try {
++      const m = new RegExp(re).exec(name);
++      if (m) {
++        if (m[1]) return m[1].toString().replace(/\W+/g, "-").toLowerCase();
++        return m[0].toString().replace(/\W+/g, "-").toLowerCase();
++      }
++    } catch {}
++  }
++  return "general";
++}
++
++function formatRename(pattern, ctx) {
++  return pattern
++    .replaceAll("{date}", ctx.date)
++    .replaceAll("{job}", ctx.job)
++    .replaceAll("{seq}", String(ctx.seq).padStart(3, "0"))
++    .replaceAll("{name}", ctx.origNameNoExt);
++}
++
++function extOf(name) {
++  const m = /\.([A-Za-z0-9]+)$/.exec(name || "");
++  return m ? m[1].toLowerCase() : "jpg";
++}
++
++function nameNoExt(name) {
++  return (name || "").replace(/\.[^.]+$/, "");
++}
++
++async function driveQueryImagesInFolder(folderId, pageSize = 200, pageToken = null) {
++  // Only images; not trashed
++  const q = [
++    `'${folderId}' in parents`,
++    "trashed = false",
++    "(mimeType contains 'image/')"
++  ].join(" and ");
++  const fields = encodeURIComponent("nextPageToken, files(id,name,mimeType,parents,md5Checksum,createdTime,modifiedTime,imageMediaMetadata)");
++  const url = `${DRIVE_FILES}?q=${encodeURIComponent(q)}&fields=${fields}&pageSize=${pageSize}${pageToken ? `&pageToken=${pageToken}` : ""}`;
++  const res = await authFetch(url);
++  if (!res.ok) throw new Error("Drive query failed");
++  return res.json();
++}
++
++async function scanFolder(folderId, rules) {
++  const pageSize = rules.pageSize || 200;
++  let pageToken = null;
++  let all = [];
++  do {
++    const { nextPageToken, files } = await driveQueryImagesInFolder(folderId, pageSize, pageToken);
++    all = all.concat(files || []);
++    pageToken = nextPageToken || null;
++  } while (pageToken);
++
++  // Build plan: rename, move, dedupe
++  const byChecksum = new Map();
++  const plan = [];
++  let seqByGroup = new Map();
++
++  for (const f of all) {
++    const { date, year, month } = tokeniseDate(f);
++    const job = inferJobName(f, rules);
++    const groupKey = `${date}_${job}`;
++    const seq = (seqByGroup.get(groupKey) || 0) + 1;
++    seqByGroup.set(groupKey, seq);
++
++    const origExt = extOf(f.name);
++    const origNameNoExt = nameNoExt(f.name);
++
++    const newName = `${formatRename(rules.renamePattern || "{date}_{job}_{seq}", {
++      date, job, seq, origNameNoExt
++    })}.${origExt}`;
++    const newPath = rules.moveTemplate
++      ? (rules.moveTemplate
++          .replaceAll("{year}", year)
++          .replaceAll("{month}", month)
++          .replaceAll("{job}", job))
++      : null;
++
++    const action = {
++      id: f.id,
++      fromParents: f.parents || [],
++      toPath: newPath,     // path under selected root (we'll map to folder IDs during APPLY)
++      renameTo: newName,
++      md5: f.md5Checksum || null,
++      originalName: f.name,
++      date,
++      job
++    };
++
++    // De-duplication plan
++    if ((rules.dedupe ?? true) && action.md5) {
++      if (byChecksum.has(action.md5)) {
++        action.duplicateOf = byChecksum.get(action.md5).id;
++      } else {
++        byChecksum.set(action.md5, action);
++      }
++    }
++
++    plan.push(action);
++  }
++
++  return { count: all.length, plan };
++}
++
++async function ensureFolderPath(rootId, pathSegments) {
++  // Walk/ensure path under rootId; return leaf folderId
++  let parentId = rootId;
++  for (const name of pathSegments) {
++    const q = encodeURIComponent([
++      `'${parentId}' in parents`,
++      "mimeType = 'application/vnd.google-apps.folder'",
++      `name = '${name.replace(/'/g, "\\'")}'`,
++      "trashed = false"
++    ].join(" and "));
++    const url = `${DRIVE_FILES}?q=${q}&fields=files(id,name)&pageSize=1`;
++    let res = await authFetch(url);
++    if (!res.ok) throw new Error("Folder lookup failed");
++    let data = await res.json();
++    if (data.files?.length) {
++      parentId = data.files[0].id;
++    } else {
++      // create
++      res = await authFetch(DRIVE_FILES, {
++        method: "POST",
++        body: JSON.stringify({
++          name,
++          mimeType: "application/vnd.google-apps.folder",
++          parents: [parentId]
++        })
++      });
++      if (!res.ok) throw new Error("Folder create failed");
++      const created = await res.json();
++      parentId = created.id;
++    }
++  }
++  return parentId;
++}
++
++async function moveFileToFolder(fileId, targetFolderId, removeParents) {
++  const url = `${DRIVE_FILES}/${fileId}?addParents=${targetFolderId}${removeParents?.length ? `&removeParents=${removeParents.join(",")}` : ""}&fields=id,parents`;
++  const res = await authFetch(url, { method: "PATCH" });
++  if (!res.ok) throw new Error(`Move failed for ${fileId}`);
++  return res.json();
++}
++
++async function renameFile(fileId, newName) {
++  const url = `${DRIVE_FILES}/${fileId}?fields=id,name`;
++  const res = await authFetch(url, {
++    method: "PATCH",
++    body: JSON.stringify({ name: newName })
++  });
++  if (!res.ok) throw new Error(`Rename failed for ${fileId}`);
++  return res.json();
++}
++
++async function trashFile(fileId) {
++  const url = `${DRIVE_FILES}/${fileId}`;
++  const res = await authFetch(url, {
++    method: "PATCH",
++    body: JSON.stringify({ trashed: true })
++  });
++  if (!res.ok) throw new Error(`Trash failed for ${fileId}`);
++  return res.json();
++}
++
++async function uploadCSVUnderFolder(folderId, name, csvText) {
++  // Multipart upload
++  const boundary = "-------314159265358979323846";
++  const delimiter = `\r\n--${boundary}\r\n`;
++  const closeDelim = `\r\n--${boundary}--`;
++
++  const metadata = {
++    name,
++    mimeType: "text/csv",
++    parents: [folderId]
++  };
++
++  const body =
++    delimiter +
++    "Content-Type: application/json; charset=UTF-8\r\n\r\n" +
++    JSON.stringify(metadata) +
++    delimiter +
++    "Content-Type: text/csv\r\n\r\n" +
++    csvText +
++    closeDelim;
++
++  const res = await authFetch(`${DRIVE_UPLOAD}?uploadType=multipart`, {
++    method: "POST",
++    headers: {
++      "Content-Type": `multipart/related; boundary=${boundary}`
++    },
++    body
++  });
++
++  if (!res.ok) throw new Error("CSV upload failed");
++  return res.json();
++}
++
++function toCSV(planApplied) {
++  const headers = ["id", "originalName", "newName", "date", "job", "movedToPath", "duplicateOf"];
++  const lines = [headers.join(",")];
++  for (const item of planApplied) {
++    lines.push([
++      item.id,
++      item.originalName?.replace(/,/g, " "),
++      item.renameTo?.replace(/,/g, " "),
++      item.date,
++      item.job,
++      (item.toPath || "").replace(/,/g, " "),
++      item.duplicateOf || ""
++    ].join(","));
++  }
++  return lines.join("\n");
++}
++
++async function applyChanges(plan, rules) {
++  // Requires: plan items contain toPath under selected root label "ROOT"
++  // popup.js supplies the chosen rootId and injects a concrete folder path.
++  const { rootId } = await chrome.storage.local.get({ rootId: null });
++  if (!rootId) throw new Error("No root folder selected in Options");
++
++  const applied = [];
++  if (rules.dryRun) {
++    return { applied: plan, dryRun: true };
++  }
++
++  for (const item of plan) {
++    // Handle duplicates first
++    if (item.duplicateOf) {
++      await trashFile(item.id);
++      applied.push(item);
++      continue;
++    }
++
++    // Move if needed
++    let targetFolderId = null;
++    if (item.toPath) {
++      const segments = item.toPath.split("/").filter(Boolean);
++      targetFolderId = await ensureFolderPath(rootId, segments);
++      await moveFileToFolder(item.id, targetFolderId, item.fromParents);
++    }
++
++    // Rename
++    if (item.renameTo && item.renameTo !== item.originalName) {
++      await renameFile(item.id, item.renameTo);
++    }
++
++    applied.push(item);
++  }
++
++  // Write manifest
++  const csv = toCSV(applied);
++  const manifestFolderId = await ensureFolderPath(rootId, ["_manifests"]);
++  await uploadCSVUnderFolder(manifestFolderId, rules.manifestName || "image-sorter-manifest.csv", csv);
++
++  return { applied, dryRun: false };
++}
+diff --git a/config.example.js b/config.example.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..15be5f55a75e59daa2e994f80b82259af027083c
+--- /dev/null
++++ b/config.example.js
+@@ -0,0 +1,35 @@
++// config.example.js
++// 1) Copy this file to config.js
++// 2) Fill in your Google OAuth 2.0 Web app client ID (see README)
++// Note: We inject config at runtime to avoid baking secrets into manifest.
++export const OAUTH = {
++  clientId: "YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com",
++  // Scopes: Drive file ops + metadata reading/writing
++  scopes: [
++    "https://www.googleapis.com/auth/drive",
++    "https://www.googleapis.com/auth/drive.metadata",
++    "https://www.googleapis.com/auth/drive.file"
++  ]
++};
++
++export const DEFAULT_RULES = {
++  // Rename pattern supports tokens: {date}, {job}, {seq}, {name}
++  renamePattern: "{date}_{job}_{seq}",
++  // Date source priority: image metadata -> createdTime
++  dateFormat: "YYYY-MM-DD",
++  // Move template: Drive folder path under selected root
++  moveTemplate: "{year}/{month}-{job}",
++  // Try to infer job from filename hints (regex list, first match wins)
++  jobHints: [
++    "(?i)(clarinda|clyde north|cranbourne|springvale|dandenong|pakenham|berwick)",
++    "(?i)job[_-]?([A-Za-z0-9]+)"
++  ],
++  // De-duplication: use md5Checksum from Drive
++  dedupe: true,
++  // Dry-run mode to preview changes
++  dryRun: true,
++  // Batch size for Drive queries to control quotas
++  pageSize: 200,
++  // CSV manifest file name
++  manifestName: "image-sorter-manifest.csv"
++};
+diff --git a/manifest.json b/manifest.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2cc8bac9ff968a6ac1d3a9e6187da8d22e07213
+--- /dev/null
++++ b/manifest.json
+@@ -0,0 +1,30 @@
++{
++  "name": "Image Drive Sorter",
++  "description": "Authenticate with Google, scan Drive folders for images, auto-sort/rename/move, de-duplicate, and export CSV manifests.",
++  "version": "1.0.0",
++  "manifest_version": 3,
++  "minimum_chrome_version": "120",
++  "action": {
++    "default_title": "Image Drive Sorter",
++    "default_popup": "popup.html"
++  },
++  "options_page": "options.html",
++  "permissions": ["storage", "identity", "scripting"],
++  "host_permissions": [
++    "https://accounts.google.com/*",
++    "https://www.googleapis.com/*"
++  ],
++  "oauth2": {
++    "client_id": "REPLACED_BY_runtime_config",
++    "scopes": []
++  },
++  "background": {
++    "service_worker": "background.js",
++    "type": "module"
++  },
++  "icons": {
++    "16": "assets/icon16.png",
++    "48": "assets/icon48.png",
++    "128": "assets/icon128.png"
++  }
++}
+diff --git a/options.css b/options.css
+new file mode 100644
+index 0000000000000000000000000000000000000000..15301e53a85dab44fc84d99e477d833e323eede2
+--- /dev/null
++++ b/options.css
+@@ -0,0 +1,11 @@
++/* options.css */
++body { font-family: system-ui, Arial, sans-serif; padding: 16px; max-width: 720px; }
++h1 { margin: 0 0 12px; }
++h2 { margin: 16px 0 8px; }
++.row { display: flex; gap: 8px; align-items: center; }
++input { flex: 1; padding: 8px; }
++button { padding: 8px 10px; border: 0; background: #202a63; color: #fff; border-radius: 6px; cursor: pointer; }
++button:hover { filter: brightness(1.1); }
++.hint { color: #666; font-size: 12px; }
++#folderList { list-style: none; padding: 0; }
++#folderList li { padding: 6px 8px; border: 1px solid #ddd; border-radius: 6px; margin: 6px 0; display: flex; justify-content: space-between; align-items: center; }
+diff --git a/options.html b/options.html
+new file mode 100644
+index 0000000000000000000000000000000000000000..5cd131aad307f8f225515f2e90622de18791799d
+--- /dev/null
++++ b/options.html
+@@ -0,0 +1,31 @@
++<!doctype html>
++<html>
++<head>
++  <meta charset="utf-8" />
++  <title>Image Drive Sorter – Options</title>
++  <link rel="stylesheet" href="options.css" />
++</head>
++<body>
++  <h1>Options</h1>
++  <section>
++    <h2>Google OAuth</h2>
++    <p>Paste your Google OAuth 2.0 Client ID (Web App):</p>
++    <input id="clientId" placeholder="xxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com" />
++    <button id="saveOauth">Save</button>
++    <p class="hint">Make sure the Authorized redirect URI includes the value shown below:</p>
++    <pre id="redirect"></pre>
++  </section>
++
++  <section>
++    <h2>Root Folder for Moves</h2>
++    <div class="row">
++      <input id="rootId" placeholder="Root Folder ID" />
++      <button id="saveRoot">Save</button>
++      <button id="pickRoot">Pick from Top Level</button>
++    </div>
++    <ul id="folderList"></ul>
++  </section>
++
++  <script type="module" src="options.js"></script>
++</body>
++</html>
+diff --git a/options.js b/options.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..34fa6644f5b0bb525cb5314240587d10e9fe0997
+--- /dev/null
++++ b/options.js
+@@ -0,0 +1,59 @@
++// options.js
++import { OAUTH } from "./config.js";
++
++const $ = (s) => document.querySelector(s);
++
++document.addEventListener("DOMContentLoaded", async () => {
++  // Show redirect URI to configure in Google Cloud Console
++  const redirectUri = chrome.identity.getRedirectURL("oauth2");
++  $("#redirect").textContent = redirectUri;
++
++  const { clientId, rootId } = await chrome.storage.local.get({
++    clientId: OAUTH.clientId || "",
++    rootId: ""
++  });
++  $("#clientId").value = clientId;
++  $("#rootId").value = rootId;
++
++  $("#saveOauth").addEventListener("click", async () => {
++    const cid = $("#clientId").value.trim();
++    if (!cid) return alert("Client ID required");
++    await chrome.storage.local.set({ clientId: cid });
++    alert("Saved. (Note: clientId is read by background at runtime.)");
++  });
++
++  $("#saveRoot").addEventListener("click", async () => {
++    const rid = $("#rootId").value.trim();
++    if (!rid) return alert("Root folder ID required");
++    await chrome.storage.local.set({ rootId: rid });
++    alert("Root folder saved.");
++  });
++
++  $("#pickRoot").addEventListener("click", async () => {
++    const auth = await send("AUTH", { interactive: true });
++    if (!auth?.ok) return alert("Auth failed");
++    const resp = await send("LIST_FOLDERS");
++    if (!resp?.ok) return alert("List failed");
++    const list = $("#folderList");
++    list.innerHTML = "";
++    for (const f of resp.folders || []) {
++      const li = document.createElement("li");
++      li.innerHTML = `<span>${f.name}</span><button data-id="${f.id}">Use</button>`;
++      list.appendChild(li);
++    }
++    list.addEventListener("click", async (e) => {
++      if (e.target.tagName === "BUTTON") {
++        const id = e.target.getAttribute("data-id");
++        await chrome.storage.local.set({ rootId: id });
++        $("#rootId").value = id;
++        alert("Root set.");
++      }
++    }, { once: true });
++  });
++});
++
++function send(type, payload = {}) {
++  return new Promise((resolve) => {
++    chrome.runtime.sendMessage({ type, ...payload }, (resp) => resolve(resp));
++  });
++}
+diff --git a/popup.css b/popup.css
+new file mode 100644
+index 0000000000000000000000000000000000000000..84841fc4658a358393da02015bda93755928538f
+--- /dev/null
++++ b/popup.css
+@@ -0,0 +1,10 @@
++/* popup.css */
++body { font-family: system-ui, Arial, sans-serif; width: 420px; margin: 0; padding: 12px; }
++h1 { font-size: 16px; margin: 0 0 8px; }
++.row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
++#rules { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
++#log { background: #0b1020; color: #d6e2ff; padding: 8px; height: 220px; overflow: auto; border-radius: 6px; }
++button { padding: 8px 10px; border: 0; background: #202a63; color: #fff; border-radius: 6px; cursor: pointer; }
++button:hover { filter: brightness(1.1); }
++input { flex: 1; padding: 6px; }
++label { font-size: 12px; color: #444; }
+diff --git a/popup.html b/popup.html
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce6919dd4f1ae087a98734c6978848a74c6a6202
+--- /dev/null
++++ b/popup.html
+@@ -0,0 +1,42 @@
++<!doctype html>
++<html>
++<head>
++  <meta charset="utf-8" />
++  <title>Image Drive Sorter</title>
++  <link rel="stylesheet" href="popup.css" />
++</head>
++<body>
++  <div id="app">
++    <h1>Image Drive Sorter</h1>
++    <div class="row">
++      <button id="btnAuth">Sign in with Google</button>
++      <span id="authStatus">Not signed in</span>
++    </div>
++
++    <div class="row">
++      <label>Root Folder (set in Options) is where moves happen.</label>
++    </div>
++
++    <div class="row">
++      <label for="folderId">Scan Folder ID</label>
++      <input id="folderId" placeholder="Drive Folder ID (not root)" />
++      <button id="btnScan">Scan</button>
++    </div>
++
++    <div class="row">
++      <label><input type="checkbox" id="dryRun" checked /> Dry run</label>
++    </div>
++
++    <div class="row">
++      <textarea id="rules" rows="10" spellcheck="false"></textarea>
++    </div>
++
++    <div class="row">
++      <button id="btnApply">Apply Changes</button>
++    </div>
++
++    <pre id="log"></pre>
++  </div>
++  <script type="module" src="popup.js"></script>
++</body>
++</html>
+diff --git a/popup.js b/popup.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..6fbbbf976746effc15982a72946f678d3de1074b
+--- /dev/null
++++ b/popup.js
+@@ -0,0 +1,65 @@
++// popup.js
++import { OAUTH, DEFAULT_RULES } from "./config.js";
++
++const $ = (s) => document.querySelector(s);
++const logEl = $("#log");
++
++function log(...args) {
++  logEl.textContent += args.map(a => (typeof a === "string" ? a : JSON.stringify(a, null, 2))).join(" ") + "\n";
++  logEl.scrollTop = logEl.scrollHeight;
++}
++
++async function send(type, payload = {}) {
++  return new Promise((resolve) => {
++    chrome.runtime.sendMessage({ type, ...payload }, (resp) => resolve(resp));
++  });
++}
++
++async function syncDryRunToRules() {
++  try {
++    const raw = $("#rules").value;
++    const rules = JSON.parse(raw);
++    rules.dryRun = $("#dryRun").checked;
++    $("#rules").value = JSON.stringify(rules, null, 2);
++  } catch {}
++}
++
++document.addEventListener("DOMContentLoaded", async () => {
++  $("#rules").value = JSON.stringify(DEFAULT_RULES, null, 2);
++
++  $("#dryRun").addEventListener("change", syncDryRunToRules);
++
++  $("#btnAuth").addEventListener("click", async () => {
++    const resp = await send("AUTH", { interactive: true });
++    if (resp?.ok) {
++      $("#authStatus").textContent = "Signed in";
++      log("✅ Signed in");
++    } else {
++      log("❌ Auth failed:", resp?.error);
++    }
++  });
++
++  $("#btnScan").addEventListener("click", async () => {
++    await syncDryRunToRules();
++    const folderId = $("#folderId").value.trim();
++    if (!folderId) return log("Enter a folder ID.");
++    log("🔍 Scanning folder:", folderId);
++    const rules = JSON.parse($("#rules").value);
++    const resp = await send("SCAN", { folderId, rules });
++    if (!resp?.ok) return log("❌ Scan failed:", resp?.error);
++    log(`Found ${resp.count} images. Proposed plan:`);
++    log(resp.plan);
++    // Stash plan
++    await chrome.storage.local.set({ lastPlan: resp.plan });
++  });
++
++  $("#btnApply").addEventListener("click", async () => {
++    const { lastPlan } = await chrome.storage.local.get({ lastPlan: [] });
++    if (!lastPlan?.length) return log("No plan to apply. Run scan first.");
++    const rules = JSON.parse($("#rules").value);
++    log(rules.dryRun ? "🧪 Dry-run: showing what would happen..." : "🚚 Applying changes...");
++    const resp = await send("APPLY", { plan: lastPlan, rules });
++    if (!resp?.ok) return log("❌ Apply failed:", resp?.error);
++    log(resp.dryRun ? "✅ Dry-run complete." : "✅ Changes applied and manifest written.");
++  });
++});
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..340234f7104f44a1d3694cfb1944bb7a4bb44331
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,5 @@
++# requirements.txt
++# This Chrome extension has no Python/Node runtime deps.
++# Optional dev tools (not required to run):
++# - prettier
++# - web-ext
+diff --git a/rules.schema.json b/rules.schema.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..f34dc684202f36fc22bceef8c3e04886729966bd
+--- /dev/null
++++ b/rules.schema.json
+@@ -0,0 +1,19 @@
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "title": "ImageSorterRules",
++  "type": "object",
++  "properties": {
++    "renamePattern": { "type": "string" },
++    "dateFormat": { "type": "string" },
++    "moveTemplate": { "type": "string" },
++    "jobHints": {
++      "type": "array",
++      "items": { "type": "string" }
++    },
++    "dedupe": { "type": "boolean" },
++    "dryRun": { "type": "boolean" },
++    "pageSize": { "type": "integer", "minimum": 50, "maximum": 1000 },
++    "manifestName": { "type": "string" }
++  },
++  "required": ["renamePattern", "moveTemplate"]
++}
+ 
+EOF
+)
